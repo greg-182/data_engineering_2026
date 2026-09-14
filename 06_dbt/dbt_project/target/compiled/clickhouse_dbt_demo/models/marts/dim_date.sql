@@ -1,3 +1,0 @@
-SELECT
-    *
-FROM `default`.`stg_dim_date`
