@@ -3,3 +3,7 @@
 05_ClickHouse/*
 09_Security_Privacy/clickhouse_data
 .requirements/
+**/pgdata/
+**/dbt_project/target/
+**/dbt_project/logs/
+**/dbt_project/dbt_packages/
