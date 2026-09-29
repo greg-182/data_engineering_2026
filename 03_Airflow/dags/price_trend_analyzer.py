@@ -35,6 +35,9 @@ default_args = {
 def fetch_and_store_price(**context):
     """Fetch the BTC price, store it, average it, and decide whether to order."""
     ts = context["logical_date"]
+    
+    response = requests.get(PRICE_API)
+    price = float(response.json()["price"])
     pg = PostgresHook(postgres_conn_id=CONN_ID)
 
     # ------------------------------------------------------------------
@@ -42,7 +45,10 @@ def fetch_and_store_price(**context):
     #   GET PRICE_API, raise on a bad HTTP status, and read the "price" field.
     #   Hint: requests.get(..., timeout=10) and response.raise_for_status()
     # ------------------------------------------------------------------
-    price = None
+    pg.run("INSERT INTO btc_prices(ts,price) VALUES (%s,%s)", parameters=(ts,price))
+    
+    print("Insert BTC price into db sucessfully")
+    # price = None
 
     # ------------------------------------------------------------------
     # TODO 2 -- Insert (ts, price) into btc_prices.
@@ -55,8 +61,13 @@ def fetch_and_store_price(**context):
     #   Hint: pg.get_first("SELECT AVG(price) FROM btc_prices WHERE ts >= %s ...")
     #   Bound the window at both ends so a re-run cannot read future rows.
     # ------------------------------------------------------------------
-    rolling_avg = None
+    
 
+    pg.get_first("SELECT AVG(price) FROM btc_prices WHERE ts >=%s", parameters=(ts-timedelta(minutes=15)))
+
+    rolling_avg = float(row[0]) if rows and rows[0] is not None else price
+
+    pg.run("INSERT INTO btc_rolling_avg(ts,rolling_avg) VALUES (%s,%s)", parameters=(ts,rolling_avg))
     # ------------------------------------------------------------------
     # TODO 4 -- Decide whether to place an order.
     #   Read the last 4 prices (newest first) from btc_prices.
@@ -67,6 +78,10 @@ def fetch_and_store_price(**context):
     #   Set `order` to a dict with keys orderType / currentPrice /
     #   rollingAveragePrice, or leave it None when there is no signal.
     # ------------------------------------------------------------------
+    last_prices= pg.get_records(
+        "SELECT ts, price FROM btc_prices ORDER BY ts DESC LIMIT 4"
+    )
+    
     order = None
 
     # ------------------------------------------------------------------

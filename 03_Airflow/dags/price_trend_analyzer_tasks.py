@@ -60,7 +60,13 @@ def fetch_price(**context):
     Return the timestamp as a string: XCom serializes values to JSON, and a
     datetime does not survive that round trip cleanly.
     """
-    raise NotImplementedError
+    response = requests.get(PRICE_API, timeout=10)
+    response.raise_for_status()
+    price = float(response.json()["price"])
+    ts = context["logical_date"]
+    print(f"Fetched BTC price {price} for {ts.isoformat()}")
+    # Returning a value pushes it to XCom under the key "return_value".
+    return {"price": price, "ts": ts.isoformat()} 
 
 
 def store_price(**context):
@@ -68,7 +74,16 @@ def store_price(**context):
 
     TODO: xcom_pull the payload from "fetch_price", then INSERT (ts, price).
     """
-    raise NotImplementedError
+    ti = context["ti"]
+    payload = ti.xcom_pull(task_ids="fetch_price")
+    price, ts = payload["price"], payload["ts"]
+
+    pg = PostgresHook(postgres_conn_id=CONN_ID)
+    pg.run(
+        "INSERT INTO btc_prices (ts, price) VALUES (%s, %s)",
+        parameters=(ts, price),
+    )
+    print(f"Stored price {price} at {ts}") 
 
 
 def compute_rolling_average(**context):
@@ -81,7 +96,23 @@ def compute_rolling_average(**context):
     Bound the window at both ends (>= cutoff AND <= ts) so re-running an old
     interval cannot pull in rows that are newer than the run itself.
     """
-    raise NotImplementedError
+    ti = context["ti"]
+    ts = pendulum.parse(ti.xcom_pull(task_ids="fetch_price")["ts"])
+    cutoff = ts - timedelta(minutes=ROLLING_WINDOW_MINUTES)
+
+    pg = PostgresHook(postgres_conn_id=CONN_ID)
+    row = pg.get_first(
+        "SELECT AVG(price) FROM btc_prices WHERE ts >= %s AND ts <= %s",
+        parameters=(cutoff, ts),
+    )
+    rolling_avg = float(row[0])
+
+    pg.run(
+        "INSERT INTO btc_rolling_avg (ts, rolling_avg) VALUES (%s, %s)",
+        parameters=(ts, rolling_avg),
+    )
+    print(f"Rolling average over {ROLLING_WINDOW_MINUTES} min: {rolling_avg}")
+    return rolling_avg
 
 
 def decide_order(**context):
@@ -97,7 +128,35 @@ def decide_order(**context):
     Return None rather than raising when fewer than 4 prices exist -- that is
     the normal state for the first few runs, not a failure.
     """
-    raise NotImplementedError
+    ti = context["ti"]
+    rolling_avg = float(ti.xcom_pull(task_ids="compute_rolling_average"))
+
+    pg = PostgresHook(postgres_conn_id=CONN_ID)
+    rows = pg.get_records("SELECT price FROM btc_prices ORDER BY ts DESC LIMIT 4")
+
+    # Not enough history yet -- normal for the first few runs.
+    if len(rows) < 4:
+        print(f"Only {len(rows)} prices so far; need 4. No signal.")
+        return None
+
+    prices = [float(r[0]) for r in reversed(rows)]
+    previous, current = prices[:-1], prices[-1]
+
+    if all(p < rolling_avg for p in previous) and current > rolling_avg:
+        order_type = "Buy"
+    elif all(p > rolling_avg for p in previous) and current < rolling_avg:
+        order_type = "Sell"
+    else:
+        print(f"No crossing: current={current}, rolling_avg={rolling_avg}")
+        return None
+
+    order = {
+        "orderType": order_type,
+        "currentPrice": current,
+        "rollingAveragePrice": rolling_avg,
+    }
+    print(f"Signal: {order}")
+    return order
 
 
 def record_order(**context):
@@ -109,7 +168,26 @@ def record_order(**context):
 
     The JSON file is what the order_submitter DAG's FileSensor waits for.
     """
-    raise NotImplementedError
+    ti = context["ti"]
+    order = ti.xcom_pull(task_ids="decide_order")
+
+    # decide_order returns None on most runs; nothing to record.
+    if not order:
+        print("No order to record.")
+        return
+
+    ts = pendulum.parse(ti.xcom_pull(task_ids="fetch_price")["ts"])
+    os.makedirs(DATA_DIR, exist_ok=True)
+    filename = os.path.join(DATA_DIR, f"order_{ts.strftime('%Y%m%dT%H%M%S')}.json")
+    with open(filename, "w") as f:
+        json.dump(order, f)
+
+    pg = PostgresHook(postgres_conn_id=CONN_ID)
+    pg.run(
+        "INSERT INTO orders_log (payload, response, status) VALUES (%s, %s, %s)",
+        parameters=(json.dumps(order), None, "created"),
+    )
+    print(f"Recorded order at {filename}")
 
 
 with DAG(
@@ -133,15 +211,32 @@ with DAG(
     #
     # Keep the task_ids exactly as they are -- xcom_pull refers to them by name.
 
-    t_fetch = EmptyOperator(task_id="fetch_price")
+    t_fetch = PythonOperator(
+        task_id="fetch_price",
+        python_callable=fetch_price,
+        # Only this task talks to the network, so it gets the extra retries.
+        retries=3,
+    )
 
-    t_store = EmptyOperator(task_id="store_price")
+    t_store = PythonOperator(
+        task_id="store_price",
+        python_callable=store_price,
+    )
 
-    t_rolling = EmptyOperator(task_id="compute_rolling_average")
+    t_rolling = PythonOperator(
+        task_id="compute_rolling_average",
+        python_callable=compute_rolling_average,
+    )
 
-    t_decide = EmptyOperator(task_id="decide_order")
+    t_decide = PythonOperator(
+        task_id="decide_order",
+        python_callable=decide_order,
+    )
 
-    t_record = EmptyOperator(task_id="record_order")
+    t_record = PythonOperator(
+        task_id="record_order",
+        python_callable=record_order,
+    )
 
     # Each step needs the previous one's result, so the graph is a chain.
     t_fetch >> t_store >> t_rolling >> t_decide >> t_record
