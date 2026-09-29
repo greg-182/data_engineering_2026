@@ -1,485 +1,395 @@
-# Practice 3: Dimensional Modeling & Star Schema
+# Practice 3: Dimensional Modeling and Star Schemas
 
-Welcome to Practice 3!  
-In the last session, we built a normalized **operational database** (OLTP) for supermarket transactions.  
-In this session, we’ll shift to building an **analytical database** (OLAP) using **dimensional modeling** and a **star schema**.
+Build and query a small sales warehouse in PostgreSQL. Starting from supermarket
+business questions, you will complete a star schema, load purchase lines, and
+check that your analytical queries answer the questions you intended to ask.
 
----
+The lecture introduces dimensional modeling. This practical focuses on applying
+those concepts; customer history and broader warehouse architecture are optional
+extensions.
 
-## Table of Contents (with Time Management)
+## Learning outcomes
 
-- [1. Analytical Needs (5 min)](#1-analytical-needs)  
-- [2. Why ER Diagrams Do Not Work Well for Analytics (10 min)](#2-why-er-diagrams-do-not-work-well-for-analytics)  
-- [3. Dimensional Modeling Concepts (25 min)](#3-dimensional-modeling-concepts)  
-  - [3.1 Identifying the Business Process (5 min)](#31-identifying-the-business-process)  
-  - [3.2 Defining the Grain of the Fact Table (5 min)](#32-defining-the-grain-of-the-fact-table)  
-  - [3.3 Identifying Dimensions (5 min)](#33-identifying-dimensions)  
-  - [3.4 Surrogate Keys & SCD (5 min)](#34-surrogate-keys--scd)  
-  - [3.5 DimDate and DimTime (5 min)](#35-dimdate-and-dimtime)  
-- [4. Task: Star Schema & OLAP Queries (10 min)](#4-task-star-schema--olap-queries)  
-- [5. Environment Setup (5 min)](#5-environment-setup)  
-- [6. Implementing in PostgreSQL (20 min)](#6-implementing-in-postgresql)  
-- [7. Management Queries (20 min)](#7-management-queries)  
-  - [7.1 Daily and Monthly Sales by Store (5 min)](#71-daily-and-monthly-sales-by-store)  
-  - [7.2 Sales by Product Category (5 min)](#72-sales-by-product-category)  
-  - [7.3 Top-Selling Products and Suppliers (5 min)](#73-top-selling-products-and-suppliers)  
-  - [7.4 Average Basket Size (5 min)](#74-average-basket-size-number-of-products-per-purchase)  
-- [8. Handling Customer Moves in OLAP (10 min)](#8-handling-customer-moves-in-olap)  
+By the end of this practice, you should be able to:
 
-___
+- State the grain of a fact table and distinguish it from a query's grouping level.
+- Connect facts to dimensions using warehouse keys while retaining source identifiers.
+- Calculate revenue, basket size, and average selling price at the correct grain.
+- Verify that joins and aggregations preserve the meaning and totals of the data.
 
-## 1. Analytical Needs
+**Prerequisites:** the Docker and PostgreSQL setup from earlier practices, basic
+SQL joins and `GROUP BY`, and the lecture's introduction to facts, dimensions,
+grain, and surrogate keys. A subquery or common table expression (`WITH`) will be
+useful for the basket exercise.
 
-Management wants to analyze supermarket sales data.  
-The following reporting requirements must be supported:
+## Session overview — 95 minutes
 
-- **Daily and monthly sales by store**  
-- **Sales by product category**  
-- **Top-selling products and suppliers**  
-- **Average basket size** (number of products per purchase)
+| Activity | Minutes | Deliverable |
+| --- | ---: | --- |
+| Business questions and scope | 5 | Definitions of revenue and basket size |
+| Design worksheet in pairs | 15 | Grain, keys, dimensions, and facts |
+| Complete the schema and load the data | 20 | Working star schema |
+| Four analytical exercises | 30 | Queries with explained results |
+| Validation and one misleading query | 15 | Reconciled totals and a corrected calculation |
+| Discussion and connection to the course project | 10 | A justified modeling decision |
+| **Total** | **95** | |
 
----
+Optional work is outside this time budget. Keep your worksheet and SQL answers
+for the discussion. Use Moodle for submission requirements, if assigned.
 
-## 2. Why ER Diagrams Do Not Work Well for Analytics
+## 1. Business questions and scope
 
-Our OLTP model from Practice 2 is excellent for transactions, but painful for analysis.  
-Key reasons:
+A supermarket analyst wants to know:
 
-- **Too many joins**: normalized data spreads information across multiple tables.  
-- **Poor performance**: queries involve lots of small tables and foreign keys.  
-- **History tracking is difficult**:  
-  - Product costs may change over time.  
-  - Customers may move to new locations.  
-- **Aggregations are scattered**:  
-  - Product price is in `Product`.  
-  - Quantity is in `PurchaseDetail`.  
-  - Computing revenue requires multiple joins instead of being centralized.
+1. How does revenue vary by store and month, and which days contribute to it?
+2. Which categories and products generate the most revenue?
+3. How many units does a customer buy in an average completed purchase?
+4. What is the average price paid per unit of each product?
 
----
+For this exercise, **revenue means the sum of line sales amounts** and **basket
+size means units per purchase**, not distinct products or the number of lines.
+All prices are EUR, quantities are whole units, and every purchase is completed.
+Returns, discounts, and tax calculations are excluded, so a line's sales amount
+is quantity multiplied by its price at the time of purchase.
 
-## 3. Dimensional Modeling Concepts
+Use four dimensions: **Date, Product, Store, and Customer**. Every purchase has
+one date, store, and customer identifier. A shopper who is not identified uses a
+reserved unknown-customer record. Supplier and payment analysis are outside the
+required model.
 
-### 3.1 Identifying the Business Process
+The synthetic source has globally unique purchase IDs within one source system.
+A product can appear on several lines of a purchase. Prices can differ between
+purchases. Customer attributes are static in the required exercise; do not run
+customer-history updates against these tables.
 
-- Determine the **core thing being measured/analyzed**, e.g., sales transactions.  
-- Each fact table corresponds to a business process (FactSales for supermarket purchases).
+## 2. Design worksheet
 
-### 3.2 Defining the Grain of the Fact Table
+Work in pairs before opening the reference solution. Record short answers:
 
-- **Grain** defines the **level of detail** in the fact table.
-- Example for supermarket:
-  - One row per **product per purchase** (fine-grained)
-  - One row per **purchase** (coarser grain)
-- Choosing the correct grain is essential for accurate aggregation.
+| Decision | Questions to answer |
+| --- | --- |
+| Business process | What event are we measuring? What is outside the model? |
+| Grain | Complete: “One fact row represents …”. Can a repeated product occur in a purchase? |
+| Dimensions | Which attributes will label, filter, and group each business question? |
+| Facts | Which numeric values do we retain? Which can we sum meaningfully? |
+| Keys | How do we distinguish a purchase, its line, and the warehouse row? |
+| Customer identity | Why retain a source `CustomerID` as well as a warehouse `CustomerKey`? |
 
-### 3.3 Identifying Dimensions
+Discuss why `(PurchaseID, ProductID)` and `(CustomerID, SaleDate)` are insufficient
+identifiers for a purchase line. Agree on your answer with the lecturer before
+completing the schema.
 
-- Descriptive attributes that provide context to facts.
-- Example dimensions for supermarket: Customer, Product, Store, Supplier, Payment, Date.
+The source-to-target mapping used by the supplied loader is:
 
-### 3.4 Surrogate Keys & SCD
+| Source value | Warehouse representation |
+| --- | --- |
+| Purchase ID and line number | Retained in the fact table to identify the source line |
+| Sale date | Lookup in `DimDate` |
+| Store, product, and customer IDs | Lookups in their dimensions to obtain warehouse keys |
+| Quantity and transaction-time unit price | Line measurements; also used to calculate the line amount |
+| Unidentified customer, represented by source ID `0` | A descriptive “Unknown customer” dimension row |
 
-- **Use surrogate keys** (integer IDs) for dimensions instead of business keys.
-- **Slowly Changing Dimensions (SCD)**:
-  - **Type 1**: overwrite old value (no history)
-  - **Type 2**: keep history with `ValidFrom` and `ValidTo` fields
-    - Current record: `ValidFrom = currentdate`, `ValidTo = 9999-12-31`
-    - Previous record: `ValidTo = currentdate - 1`
-- Example: customer moves to new city, SCD Type 2 keeps historical purchases accurate.
+The loader supplies a small example of these lookups. Building a complete ETL
+pipeline is not part of this session.
 
-### 3.5 DimDate and DimTime
+## 3. Environment, schema, and data
 
-- Pre-built date dimension (`DimDate`) allows fast aggregation by day, month, quarter, year.
-- Optional `DimTime` supports feature engineering for hour/minute analysis.
+### Environment preparation
 
----
+We use the same PostgreSQL and pgAdmin tools as in Practice 2. Create an empty
+folder on your computer for this practice, for example `star-schema-practice`,
+outside the course repository. This is your **workspace**: you will add files to
+it as you work through the exercise. You can read the course materials on GitHub
+or in a local checkout; cloning the repository is not required.
 
-## 4. Task: Star Schema & OLAP Queries
+1. Save the supplied [compose.yml](compose.yml) and [.gitignore](.gitignore) in
+   your workspace, keeping those filenames. Copy their contents or download the
+   raw files from the links.
+2. Example environment variables are in [.env_example](.env_example). Copy its
+   contents into `.env` in the same folder as `compose.yml`, keeping the variable
+   names and structure. Set the values for your local database and pgAdmin.
+3. Create an empty `sql` folder. You will save the SQL files there in later steps.
 
-### ER Model (from Practice 2 – OLTP)
-Entities included:  
-- **Customer**  
-- **Product** (with Category, Supplier)  
-- **Store**  
-- **Purchase** (with PurchaseDetail)  
-- **Payment**  
+Your initial workspace should look like this:
 
-These were normalized for operations.
-
-### Star Schema (for OLAP)
-
-```mermaid
-erDiagram
-    FACT_SALES {
-        int SaleID PK
-        int DateKey FK
-        int CustomerKey FK
-        int ProductKey FK
-        int StoreKey FK
-        int SupplierKey FK
-        int PaymentKey FK
-        int Quantity
-        numeric SalesAmount
-    }
-
-    DIM_CUSTOMER {
-        int CustomerKey PK
-        string FirstName
-        string LastName
-        string Segment
-        string City
-        date ValidFrom
-        date ValidTo
-    }
-
-    DIM_PRODUCT {
-        int ProductKey PK
-        string ProductName
-        string Category
-        string Brand
-    }
-
-    DIM_SUPPLIER {
-        int SupplierKey PK
-        string SupplierName
-        string ContactInfo
-    }
-
-    DIM_STORE {
-        int StoreKey PK
-        string StoreName
-        string City
-        string Region
-    }
-
-    DIM_DATE {
-        int DateKey PK
-        date FullDate
-        int Year
-        int Month
-        int Day
-        string DayOfWeek
-    }
-
-    DIM_PAYMENT {
-        int PaymentKey PK
-        string PaymentType
-    }
-
-    FACT_SALES ||--o{ DIM_CUSTOMER : "customer"
-    FACT_SALES ||--o{ DIM_PRODUCT : "product"
-    FACT_SALES ||--o{ DIM_SUPPLIER : "supplier"
-    FACT_SALES ||--o{ DIM_STORE : "store"
-    FACT_SALES ||--o{ DIM_DATE : "date"
-    FACT_SALES ||--o{ DIM_PAYMENT : "payment"
+```text
+star-schema-practice/
+├── compose.yml
+├── .env
+├── .gitignore
+└── sql/
 ```
 
----
+The supplied configuration uses host ports **5434** for PostgreSQL and **5052**
+for pgAdmin, so it can run alongside the earlier practice. Starting the services
+also creates `pgdata/` in your workspace for PostgreSQL's database files.
 
-## 5. Environment Setup
+> **Why keep an example file and a local settings file?**
+>
+> We track `.env_example` in Git to document the required variables using safe
+> demonstration values. Your `.env` holds your local settings, which may include
+> passwords. The supplied `.gitignore` excludes `.env` and `pgdata/` if you put
+> your workspace under Git version control. Keep real credentials out of tracked
+> files. When adding a required variable, update the example as well. Ignoring
+> `.env` does not encrypt it or remove secrets already committed to Git history.
 
-We will use the same environment setup as in Practice 2.
-The compose.yml file remains exactly the same, so no changes are required.
+Open a terminal in your workspace, **in the folder containing `compose.yml`**.
+Run all `docker compose` commands in this guide from that folder:
 
-## 6. Implementing in PostgreSQL
+```bash
+docker compose up -d
+docker compose ps
+```
 
-We will use a star schema for supermarket analytics. The tables you need to create are:
+The `-d` option runs the services in the background, leaving your terminal free.
+`docker compose ps` shows their status. Wait until `db` reports `healthy` before
+running SQL; if it is still starting, check the status again after a few seconds.
 
-DimDate – contains dates and calendar attributes (year, month, day, day of week)
+The Compose mount `./sql:/sql:ro` makes your local `sql/` folder available at
+`/sql/` inside the database container. `ro` means the container can read these
+files; you edit them on your computer. Files added to this folder later are also
+available in the container without restarting it.
 
-DimStore – information about stores (name, city, region)
+Choose one SQL client:
 
-DimProduct – product details (name, category, brand)
+| Client | Connection |
+| --- | --- |
+| Terminal inside the database container | `docker compose exec db psql` |
+| pgAdmin | Open `http://localhost:5052`, log in with the pgAdmin values in `.env`, and register a server with host `db`, port `5432`, and the PostgreSQL database/user/password from `.env` |
+| A client installed on your computer, such as DBeaver | Host `localhost`, port `5434`, and the PostgreSQL values from `.env` |
 
-DimSupplier – supplier information (name, contact info)
+If you changed the host ports in `.env`, use those instead. The practice tables
+are in the `star` schema, inside the default `star_schema` database. Include the
+schema name when writing queries, for example `star.FactSales` or `star.DimProduct`.
 
-DimCustomer – customer details with history (name, segment, city, valid from/to dates)
+### Complete the starter schema
 
-DimPayment – types of payment (cash, card, voucher)
+Save the [starter schema](starter/01_create_tables.sql) as
+`sql/01_create_tables.sql` in your workspace, then open your local copy in an
+editor. The dimensions and most of the fact table are supplied. Replace the three
+placeholders with:
 
-FactSales – the central fact table recording each sale with quantity and amount, linking to all dimensions
+1. The customer dimension reference, including its key column.
+2. The columns that uniquely identify a source purchase line.
+3. The rule relating the line amount to its quantity and unit price.
 
-Each dimension provides context for the sales in FactSales, making it easy to analyze performance across different perspectives.
+The ordinary dimensions have generated surrogate keys and separate source IDs.
+The calendar dimension uses a deterministic `YYYYMMDD` key; use its attributes,
+not arithmetic on that key, for calendar analysis.
+
+### Run the SQL files
+
+Save the supplied [data loader](starter/02_load_data.sql) as
+`sql/02_load_data.sql` in your workspace. Once you have completed the starter
+schema, run these commands from the folder containing `compose.yml`:
+
+```bash
+docker compose exec db psql -v ON_ERROR_STOP=1 -f /sql/01_create_tables.sql
+docker compose exec db psql -v ON_ERROR_STOP=1 -f /sql/02_load_data.sql
+```
+
+`docker compose exec db psql` runs PostgreSQL's command-line client inside the
+database container. The options mean:
+
+- `-v ON_ERROR_STOP=1` tells `psql` to stop the script at the first SQL error.
+  By default, it continues, which can produce further errors that hide the
+  original problem. Fix the reported error before running the next file.
+- `-f` selects the SQL file to execute inside the container. For example, your
+  local `sql/02_load_data.sql` is available there as `/sql/02_load_data.sql`.
+
+The first command intentionally **recreates the `star` schema and deletes its
+previous practice data**. It does not reset the whole database. The loader replaces
+only the data in the five practice tables, so it can be rerun to restore the
+sample data. Both scripts use transactions, so a failed run does not leave their
+changes partly applied.
+
+Alternatively, paste the complete contents of each local SQL file into pgAdmin's
+Query Tool and execute them in the same order. With DBeaver, open the local files
+and execute each as a script. The `/sql/` paths above belong to the database
+container; use your local copies with these clients. If an error leaves a
+transaction open, issue `ROLLBACK;` before trying the corrected file again.
 
 <details>
-<summary>Solution</summary>
+<summary>Reference schema if you need help or are short of time</summary>
 
-### Example Schema
+Compare your choices with [the completed schema](solution/01_create_tables.sql).
+To run it, save a separate copy as `sql/01_create_tables_reference.sql` in your
+workspace, preserving your starter work. Use the data loader you saved above:
 
-```sql
-CREATE TABLE DimDate (
-    DateKey SERIAL PRIMARY KEY,
-    FullDate DATE NOT NULL,
-    Year INT,
-    Month INT,
-    Day INT,
-    DayOfWeek VARCHAR(10)
-);
-
-CREATE TABLE DimStore (
-    StoreKey SERIAL PRIMARY KEY,
-    StoreName VARCHAR(100),
-    City VARCHAR(50),
-    Region VARCHAR(50)
-);
-
-CREATE TABLE DimProduct (
-    ProductKey SERIAL PRIMARY KEY,
-    ProductName VARCHAR(100),
-    Category VARCHAR(50),
-    Brand VARCHAR(50)
-);
-
-CREATE TABLE DimSupplier (
-    SupplierKey SERIAL PRIMARY KEY,
-    SupplierName VARCHAR(100),
-    ContactInfo VARCHAR(255)
-);
-
-CREATE TABLE DimCustomer (
-    CustomerKey INT NOT NULL,         -- stable business key
-    FirstName VARCHAR(50),
-    LastName VARCHAR(50),
-    Segment VARCHAR(50),
-    City VARCHAR(50),
-    ValidFrom DATE,
-    ValidTo DATE
-);
-
-
-CREATE TABLE DimPayment (
-    PaymentKey SERIAL PRIMARY KEY,
-    PaymentType VARCHAR(20)
-);
-
-CREATE TABLE FactSales (
-    SaleID SERIAL PRIMARY KEY,
-    DateKey INT REFERENCES DimDate(DateKey),
-    StoreKey INT REFERENCES DimStore(StoreKey),
-    ProductKey INT REFERENCES DimProduct(ProductKey),
-    SupplierKey INT REFERENCES DimSupplier(SupplierKey),
-    CustomerKey INT,
-    PaymentKey INT REFERENCES DimPayment(PaymentKey),
-    Quantity INT,
-    SalesAmount NUMERIC(10,2)
-);
-```
-</details>
----
-
-
-
-## 6. Populate Dummy Data
-
-Before running analytical queries, we need some dummy data in our tables.
-This data simulates real supermarket operations and allows you to practice queries on FactSales and the dimensions.
-
-The dummy data includes: dates, stores, products, suppliers, customers, payment types, and sample sales.
-Once inserted, you can run the queries for daily sales, top products, average basket size, and more.
-
-
-<details>
-<summary>Solution</summary>
-
-```sql
--- DimDate
-INSERT INTO DimDate (FullDate, Year, Month, Day, DayOfWeek)
-VALUES 
-('2025-09-18', 2025, 9, 18, 'Thursday'),
-('2025-09-19', 2025, 9, 19, 'Friday'),
-('2025-09-20', 2025, 9, 20, 'Saturday');
-
--- DimStore
-INSERT INTO DimStore (StoreName, City, Region)
-VALUES
-('SuperMart Downtown', 'Tallinn', 'North'),
-('SuperMart Suburb', 'Tartu', 'South');
-
--- DimProduct
-INSERT INTO DimProduct (ProductName, Category, Brand)
-VALUES
-('Apple', 'Fruit', 'FreshFarm'),
-('Banana', 'Fruit', 'Tropicana'),
-('Milk', 'Dairy', 'DairyBest'),
-('Bread', 'Bakery', 'BakeHouse');
-
--- DimSupplier
-INSERT INTO DimSupplier (SupplierName, ContactInfo)
-VALUES
-('FreshFarm Supplier', 'fresh@farm.com'),
-('Tropicana Supplier', 'contact@tropicana.com'),
-('DairyBest Supplier', 'sales@dairybest.com'),
-('BakeHouse Supplier', 'info@bakehouse.com');
-
-  
---dimcustomer
-INSERT INTO DimCustomer (CustomerKey, FirstName, LastName, Segment, City, ValidFrom, ValidTo)
-VALUES
-(1, 'Alice', 'Smith', 'Regular', 'Tallinn', '2025-01-01', '9999-12-31'),
-(2, 'Bob', 'Jones', 'VIP', 'Tartu', '2025-01-01', '9999-12-31');
-
-
--- DimPayment
-INSERT INTO DimPayment (PaymentType)
-VALUES
-('Cash'), ('Card'), ('Voucher');
-
--- FactSales
-INSERT INTO FactSales (DateKey, StoreKey, ProductKey, SupplierKey, CustomerKey, PaymentKey, Quantity, SalesAmount)
-VALUES
-(1, 1, 1, 1, 1, 2, 5, 5*1.2),
-(1, 1, 2, 2, 1, 1, 3, 3*0.8),
-(2, 2, 3, 3, 2, 2, 2, 2*2.5),
-(2, 2, 4, 4, 2, 2, 1, 1*1.5),
-(3, 1, 1, 1, 2, 1, 10, 10*1.2),
-(3, 1, 3, 3, 1, 2, 1, 1*2.5);
-
-```
-</details>
----
-
-## 7. Management Queries
-
-### 7.1 Daily and Monthly Sales by Store
-
-In this section, we will write queries to analyze sales performance at the store level. The focus is on aggregating sales data by day and by month to identify trends, peak periods, and store-wise performance.
-
-<details>
-<summary>Solution</summary>
-
-```sql
--- Daily sales per store
-SELECT d.FullDate, s.StoreName, SUM(f.SalesAmount) AS DailySales
-FROM FactSales f
-JOIN DimDate d ON f.DateKey = d.DateKey
-JOIN DimStore s ON f.StoreKey = s.StoreKey
-GROUP BY d.FullDate, s.StoreName
-ORDER BY d.FullDate, s.StoreName;
-
--- Monthly sales per store
-SELECT d.Year, d.Month, s.StoreName, SUM(f.SalesAmount) AS MonthlySales
-FROM FactSales f
-JOIN DimDate d ON f.DateKey = d.DateKey
-JOIN DimStore s ON f.StoreKey = s.StoreKey
-GROUP BY d.Year, d.Month, s.StoreName
-ORDER BY d.Year, d.Month, s.StoreName;
+```bash
+docker compose exec db psql -v ON_ERROR_STOP=1 -f /sql/01_create_tables_reference.sql
+docker compose exec db psql -v ON_ERROR_STOP=1 -f /sql/02_load_data.sql
 ```
 
-### 7.2 Sales by Product Category
-
-```sql
-SELECT p.Category, SUM(f.SalesAmount) AS TotalSales
-FROM FactSales f
-JOIN DimProduct p ON f.ProductKey = p.ProductKey
-GROUP BY p.Category
-ORDER BY TotalSales DESC;
-```
-
-### 7.3 Top-Selling Products and Suppliers
-
-```sql
--- Top 5 products by sales amount
-SELECT p.ProductName, SUM(f.SalesAmount) AS TotalSales
-FROM FactSales f
-JOIN DimProduct p ON f.ProductKey = p.ProductKey
-GROUP BY p.ProductName
-ORDER BY TotalSales DESC
-LIMIT 5;
-
--- Top 5 suppliers by sales amount
-SELECT sp.SupplierName, SUM(f.SalesAmount) AS TotalSales
-FROM FactSales f
-JOIN DimSupplier sp ON f.SupplierKey = sp.SupplierKey
-GROUP BY sp.SupplierName
-ORDER BY TotalSales DESC
-LIMIT 5;
-```
-
-### 7.4 Average Basket Size (Number of Products per Purchase)
-
-```sql
-SELECT f.CustomerSurrKey, d.FullDate, AVG(f.Quantity) AS AvgBasketSize
-FROM FactSales f
-JOIN DimDate d ON f.DateKey = d.DateKey
-GROUP BY f.CustomerSurrKey, d.FullDate
-ORDER BY f.CustomerSurrKey, d.FullDate;
-```
-</details>
----
-
-## 8. Handling Customer Moves in OLAP
-
-- **Problem in OLTP**: updating customer address overwrites history; past purchases show new city, which is SCD Type 1. 
-
-**SCD Type 1 (Overwrite – No History)**
-
-Old Data
-
-| CustomerKey | FirstName | LastName | Segment | City    |
-| ----------- | --------- | -------- | ------- | ------- |
-| 1           | Alice     | Smith    | Regular | Tallinn |
-
-
-New Data 
-
-| CustomerKey | FirstName | LastName | Segment | City    |
-| ----------- | --------- | -------- | ------- | ------- |
-| 1           | Alice     | Smith    | Regular | Tartu   |
-
-The old city (Tallinn) is lost. Past purchases now appear under the new city.
-
-
-
-- **Solution in OLAP (SCD Type 2)**: maintain historical records with `ValidFrom` and `ValidTo`.
-
-Example:
-
-| CustomerKey | FirstName | LastName | Segment | City    | ValidFrom  | ValidTo    |
-| ----------- | --------- | -------- | ------- | ------- | ---------- | ---------- |
-| 1           | Alice     | Smith    | Regular | Tallinn | 2025-01-01 | 2025-09-20 |
-| 3           | Alice     | Smith    | Regular | Tartu   | 2025-09-21 | 9999-12-31 |
-
-Alice's new CustomerKey is 3 because Bob is 2. 
-<details>
-<summary>Solution</summary>
-
-```sql
--- Customer moves to Tartu (SCD Type 2)
--- Mark old record as not current
-UPDATE DimCustomer
-SET ValidTo = CURRENT_DATE - INTERVAL '1 day'
-WHERE CustomerKey = 1
-  AND ValidTo = '9999-12-31';
-
-INSERT INTO DimCustomer (CustomerKey, FirstName, LastName, Segment, City, ValidFrom, ValidTo)
-VALUES (3, 'Alice', 'Smith', 'Regular', 'Tartu', CURRENT_DATE, '9999-12-31');
-
--- FactSales automatically references the correct CustomerKey at transaction time
-INSERT INTO FactSales (DateKey, StoreKey, ProductKey, SupplierKey, CustomerKey, PaymentKey, Quantity, SalesAmount)
-VALUES (3, 2, 2, 2, 3, 2, 4, 4*0.8);
-
--- Query to see sales by customer including moves
-SELECT c.FirstName || ' ' || c.LastName AS CustomerName, c.City, SUM(f.SalesAmount) AS TotalSales
-FROM FactSales f
-JOIN DimCustomer c ON f.CustomerKey = c.customerkey
-GROUP BY CustomerName, c.City
-ORDER BY CustomerName, c.City;
-
--- Query sales by city considering SCD
-SELECT c.City, SUM(f.SalesAmount) AS TotalSales
-FROM FactSales f
-JOIN DimCustomer c ON f.CustomerKey = c.CustomerKey
-GROUP BY c.City
-ORDER BY TotalSales DESC;
-
-``` 
+The [reference guide](solution/README.md) includes the model diagram and explanations.
 
 </details>
 
+### Inspect the sample data
 
-**Explanation:**
-- Historical purchases remain linked to the original city.
-- New purchases after the move link to the new city.
-- This ensures analytics correctly reflects sales by location and customer history.
+There are **15 purchase lines, 7 purchases, 43 units, and EUR 56.90 in revenue**.
+The calendar covers September and October 2026, including days without sales.
 
+Inspect purchase IDs `1001` and `1002` (Alice's separate purchases on the same
+day) and purchase `1006` (an unidentified shopper with Apple on two lines).
+Locate these cases in your local `sql/02_load_data.sql`. They are intentional
+tests of your grain and aggregation choices.
 
+## 4. Analytical exercises
+
+Create `sql/03_analysis.sql` in your workspace and save your answers there. Run
+queries in your chosen SQL client. Use dimension attributes for readable labels
+and source or warehouse identifiers to distinguish entities that might share a name.
+
+### A. Store revenue: month to day
+
+Write two queries to answer how revenue varies over time for each store:
+
+1. **Monthly report:** one row per store and calendar month, with year, month,
+   store ID, store name, and revenue in EUR. Sort by year, month, then store ID.
+2. **Daily report:** drill down to one row per store and date, with date, store ID,
+   store name, and revenue in EUR. Sort by date, then store ID.
+
+**Hint:** join `star.FactSales` to `star.DimDate` and `star.DimStore` using their
+keys, then sum `SalesAmount` for each group. Use both `CalendarYear` and
+`MonthNumber` for the monthly report, and `FullDate` for the daily report.
+
+Explain what changes in your query and what remains unchanged in the stored fact
+rows. Days with no sales may be absent from the result; producing zero-sales days
+is optional.
+
+### B. Categories and products
+
+Write two queries to identify what generates the most revenue:
+
+1. **Category report:** one row per category, with category and revenue in EUR,
+   highest revenue first.
+2. **Top products:** three rows, with product ID, product name, and revenue in EUR,
+   highest revenue first. Use ascending product ID to break revenue ties.
+
+**Hint:** both reports use the same join to `star.DimProduct`. Change the grouping
+from category to product; apply `ORDER BY` before `LIMIT 3` in the product report.
+
+Explain why a product's category is useful as a dimension attribute and why the
+category report can use the same fact table as the product report.
+
+### C. Average basket size
+
+Find how many units are bought in an average completed purchase. Produce:
+
+1. **Basket totals:** one row per purchase, with `PurchaseID` and total units,
+   ordered by purchase ID. The sample data should produce seven rows.
+2. **Average basket size:** one value, the average of those seven totals, displayed
+   to four decimal places. Each purchase must contribute equally, regardless of
+   its number of lines.
+
+**Hint:** first sum `Quantity` grouped by `PurchaseID`. Use that result in a
+subquery or `WITH` expression, then apply `AVG` to the purchase totals.
+
+Explain why grouping by customer and day would merge purchases `1001` and `1002`.
+What would you change if management asked for distinct products per basket?
+
+### D. Average selling price
+
+Find the average price actually paid per unit of each product. Return one row per
+product with product ID, product name, total units, revenue in EUR, average price
+paid per unit, and `AVG(UnitPrice)` for comparison. Sort by product ID and display
+both average prices to four decimal places.
+
+**Hint:** divide the product's total revenue by its total units:
+`SUM(SalesAmount) / SUM(Quantity)`. Calculate before rounding; use `ROUND(..., 4)`
+for display.
+
+Use Apple's purchases to explain why the two results differ. Which calculation
+answers the business question, and what does the other calculation measure?
+
+## 5. Validate and diagnose
+
+First write checks of your own: count rows and purchases, total units and revenue,
+and confirm that joining all four dimensions preserves the fact count and revenue.
+Reconcile the daily store totals with the monthly totals. How would a missing or
+nonunique dimension match affect these checks?
+
+Save the supplied [data checks](starter/04_validate.sql) as
+`sql/04_validate.sql` in your workspace, then run them from the folder containing
+`compose.yml`:
+
+```bash
+docker compose exec db psql -v ON_ERROR_STOP=1 -f /sql/04_validate.sql
+```
+
+All checks should report `t` (true). The script raises an error if an expectation
+fails. It checks the loaded data, not the SQL answers saved in your editor;
+compare those separately with the [expected results](solution/README.md#expected-results).
+
+This query runs successfully but is labeled incorrectly:
+
+```sql
+SELECT c.CustomerID, d.FullDate, AVG(f.Quantity) AS AverageBasketSize
+FROM star.FactSales AS f
+JOIN star.DimCustomer AS c ON c.CustomerKey = f.CustomerKey
+JOIN star.DimDate AS d ON d.DateKey = f.DateKey
+GROUP BY c.CustomerID, d.FullDate;
+```
+
+For Alice on September 30 it returns `2.5`. Her two baskets contain `3` and `7`
+units, so their average is `5`. Explain both problems: the query averages lines,
+and its grouping does not identify purchases. Correct it using your answer to C.
+
+## 6. Discussion
+
+Be ready to explain:
+
+- Your declared fact grain, and why a report can group at a coarser level.
+- Why revenue adds across stores and dates, but unit prices should not be summed.
+- Why a star schema helps an analyst navigate business labels and measures.
+- One process in your course project that could use a similar design, and a
+  business question it would support.
+
+A normalized operational model and a dimensional analytical model serve different
+workloads. A star schema is still relational and can be drawn as an ER diagram;
+its simpler business-facing structure does not guarantee faster queries in every
+case. This tiny dataset demonstrates correctness, not a performance benchmark.
+
+## Optional extensions — outside the required session
+
+Choose these after completing the core work; none is a prerequisite for it.
+
+- **Customer history (20–30 minutes):** [SCD Type 2 exercise](optional/scd2/README.md)
+  with its own schema and fixed event dates. Investigate a move and a late-arriving sale.
+- **Shared dimensions (5–10 minutes):** sketch a bus matrix with sales and daily
+  inventory as rows and Date, Product, Store, and Customer as columns. Which
+  dimensions can be shared? Why can inventory balance be added across stores
+  but not across consecutive dates? No second fact table implementation is required.
+- **Model boundaries (5–10 minutes):** consider a purchase paid partly by cash and
+  partly by card. Explain why copying the full purchase revenue to both payment
+  methods would double count it. Discuss what additional source data you would need.
+- **Zero-sales days (10 minutes):** extend A to show all calendar days for each
+  store, including zero revenue. Keep this separate from the required query.
+
+## References
+
+- [Solution guide and expected results](solution/README.md)
+- [Reference queries](solution/03_analysis.sql)
+- [The Data Warehouse Toolkit, 3rd edition, chapters 1 and 2](https://learning.oreilly.com/library/view/the-data-warehouse/9781118530801/)
+- [Kimball's four-step design process](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/four-4-step-design-process/)
+- [Additive, semi-additive, and non-additive facts](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/additive-semi-additive-non-additive-fact/)
+
+## Stopping and troubleshooting
+
+From the folder containing `compose.yml`, `docker compose down` stops and removes
+this lesson's containers. The database files remain in your workspace's
+`pgdata/` directory, which the supplied `.gitignore` excludes from Git. Rerun the
+schema and load scripts to reset the core exercise; no database-directory deletion
+is needed. PostgreSQL credentials and database creation settings in `.env` apply
+when that data directory is first initialized, not on every restart.
+
+| Symptom | Check |
+| --- | --- |
+| Compose cannot find a configuration file | Open the terminal in your workspace, in the folder containing `compose.yml`. |
+| `psql` cannot open `/sql/...` | Save the named file under your workspace's `sql/` folder. Check its filename and ensure you downloaded SQL rather than a GitHub HTML page. |
+| A port is already allocated | Choose a free `POSTGRES_PORT` or `PGADMIN_PORT` in `.env`, recreate the containers, and update your client connection. |
+| Relation `factsales` does not exist | Run the schema and loader; select the configured database and `star` schema. |
+| Syntax error containing `__...__` | Complete all three starter placeholders or use the reference schema. |
+| A validation check fails | Inspect the first failed expectation and your schema changes; reload the sample data before comparing reference answers. |
+| Credentials fail after editing `.env` | An existing `pgdata` keeps its original database and credentials. Use those settings or prepare a separate empty data directory, preserving any data you need. |
