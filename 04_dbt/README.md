@@ -246,9 +246,14 @@ Work through the steps in order — each one builds on the previous.
 
 Open `dbt_project/seeds/` and read the five CSV files. Answer these questions:
 
-- What is the natural key of each table?
+- What is the natural key of each table? customer_id, product_id, store_id,order_id, item_id
 - Which columns need to be cast to a different type?
+raw_customers(created at, updated at) - cast to DATE, TIMESTAMP, currently palintext
+raw_orders.order_date - same
+raw_products.unit_price - cast to numeric/decimal
+
 - Which column in `raw_customers` drives SCD2 history tracking?
+segment
 
 ---
 
