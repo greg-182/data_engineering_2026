@@ -57,7 +57,10 @@ selected_regions = st.sidebar.multiselect(
 
 # TASK 6: Replace the next line with the category multiselect shown in README.
 # The app is usable now: it starts with every category selected.
-selected_categories = all_categories
+# Show all categories at first; the user can then choose a smaller set.
+selected_categories = st.sidebar.multiselect(
+    "Categories", all_categories, default=all_categories
+)
 
 # Keep only rows included by both sidebar selections.
 visible = sales[
